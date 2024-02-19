@@ -259,12 +259,12 @@ where
         Ok(())
     }
 
-    pub async fn run(mut self, kill_signal: &Arc<RwLock<bool>>) {
+    pub async fn run(mut self, kill_signal: Arc<RwLock<bool>>) {
         try_and_log!(self.init_peers().await);
 
         // Use this node state to Initial Block download
         let mut ibd = UtreexoNode(self.0, ChainSelector::default());
-        try_and_log!(UtreexoNode::<ChainSelector, Chain>::run(&mut ibd, kill_signal).await);
+        try_and_log!(UtreexoNode::<ChainSelector, Chain>::run(&mut ibd, &kill_signal).await);
 
         // Then take the final state and run the node
         self = UtreexoNode(ibd.0, self.1);
