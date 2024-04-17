@@ -40,6 +40,7 @@ use crate::node_interface::NodeInterface;
 use crate::node_interface::NodeResponse;
 use crate::node_interface::UserRequest;
 use crate::p2p_wire::chain_selector::ChainSelector;
+use crate::p2p_wire::sync_node::SyncNode;
 
 #[derive(Debug, Clone)]
 pub struct RunningNode {
@@ -176,7 +177,7 @@ where
             let (_, time) = self.inflight.get(request).unwrap();
             if time.elapsed() > Duration::from_secs(RunningNode::REQUEST_TIMEOUT) {
                 timed_out.push(request.clone());
-                warn!("Request {:?} timed out", request);
+                debug!("Request {:?} timed out", request);
             }
         }
 
@@ -274,11 +275,25 @@ where
         let mut ibd = UtreexoNode(self.0, ChainSelector::default());
         try_and_log!(UtreexoNode::<ChainSelector, Chain>::run(&mut ibd, kill_signal.clone()).await);
 
+        if *kill_signal.read().await {
+            return;
+        }
+
+        // download all blocks from the network
+        let mut sync = UtreexoNode(ibd.0, SyncNode::default());
+        if sync.0.chain.get_height().unwrap() < sync.0.chain.get_validation_index().unwrap() {
+            UtreexoNode::<SyncNode, Chain>::run(&mut sync, kill_signal.clone()).await;
+
+            if *kill_signal.read().await {
+                return;
+            }
+        }
+
         // Then take the final state and run the node
-        self = UtreexoNode(ibd.0, self.1);
-        info!("starting running node...");
+        self = UtreexoNode(sync.0, self.1);
         self.last_block_request = self.chain.get_validation_index().unwrap_or(0);
 
+        info!("starting running node...");
         loop {
             while let Ok(notification) =
                 timeout(Duration::from_millis(100), self.node_rx.recv()).await
@@ -375,9 +390,40 @@ where
 
             // Check if we haven't missed any block
             if self.inflight.len() < 10 {
-                try_and_log!(self.ask_block().await);
+                try_and_log!(self.ask_missed_block().await);
             }
         }
+    }
+
+    async fn ask_missed_block(&mut self) -> Result<(), WireError> {
+        let tip = self.chain.get_height().unwrap();
+        let next = self.chain.get_validation_index().unwrap();
+        if tip == next {
+            return Ok(());
+        }
+
+        let mut blocks = Vec::new();
+        for i in (next + 1)..=tip {
+            let hash = self.chain.get_block_hash(i)?;
+            // already requested
+            if self.inflight.contains_key(&InflightRequests::Blocks(hash)) {
+                continue;
+            }
+
+            // already downloaded
+            if self.blocks.contains_key(&hash) {
+                continue;
+            }
+
+            blocks.push(hash);
+        }
+
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        self.request_blocks(blocks).await?;
+        Ok(())
     }
 
     async fn request_rescan_block(&mut self) -> Result<(), WireError> {
